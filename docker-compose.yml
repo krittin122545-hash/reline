@@ -9,7 +9,7 @@ services:
       - mongo-data:/data/db
 
   reline-bot:
-    build: .
+    image: kikonet0122545/reline:1.0.1
     restart: unless-stopped
     depends_on:
       - mongo
