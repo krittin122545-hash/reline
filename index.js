@@ -76,6 +76,15 @@ async function connectMongo() {
 
     await mongoDb.collection("reline_logs").createIndex({ createdAt: -1 });
     await mongoDb.collection("reline_logs").createIndex({ monthKey: 1, chatId: 1 });
+    await mongoDb.collection("reline_logs").createIndex(
+      { chatId: 1, shiftKey: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          shiftKey: { $exists: true },
+        },
+      }
+    );
     console.log("MongoDB connected:", mongoUri);
     return mongoDb;
   } catch (error) {
@@ -85,14 +94,25 @@ async function connectMongo() {
 }
 
 async function saveRelineToMongo(payload) {
+  const db = await connectMongo();
+  const collection = db.collection("reline_logs");
+
   try {
-    const db = await connectMongo();
-    await db.collection("reline_logs").insertOne({
+    await collection.insertOne({
       ...payload,
       createdAt: new Date(),
     });
+    return { accepted: true };
   } catch (error) {
-    console.error("MongoDB save failed:", error.message);
+    if (error.code === 11000) {
+      const existing = await collection.findOne({
+        chatId: payload.chatId,
+        shiftKey: payload.shiftKey,
+      });
+      return { accepted: false, existing };
+    }
+
+    throw error;
   }
 }
 
@@ -180,6 +200,30 @@ function getShift(date) {
   if (h >= 12 && h < 18) return "12-18";
   if (h >= 18 && h < 24) return "18-24";
   return "00-06";
+}
+
+function getShiftWindow(date) {
+  const start = new Date(date);
+  const h = start.getHours();
+  const startHour = h >= 18 ? 18 : h >= 12 ? 12 : h >= 6 ? 6 : 0;
+  start.setHours(startHour, 0, 0, 0);
+
+  const end = new Date(start);
+  end.setHours(start.getHours() + 6);
+
+  return {
+    start,
+    end,
+    key: start.toISOString(),
+  };
+}
+
+function formatResetTime(date) {
+  return date.toLocaleTimeString("th-TH", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function getMonthKey(date) {
@@ -316,6 +360,7 @@ bot.on("message", async (msg) => {
 
     const now = new Date();
     const shift = getShift(now);
+    const shiftWindow = getShiftWindow(now);
     const monthKey = getMonthKey(now);
     const username = msg.from.username || "";
     const fullname = `${msg.from.first_name || ""} ${msg.from.last_name || ""}`.trim();
@@ -329,7 +374,34 @@ bot.on("message", async (msg) => {
 
     if (!isReline && !isCountdown) return;
 
-    // Insert into database
+    const mongoResult = await saveRelineToMongo({
+      telegramId,
+      username,
+      fullname,
+      relineTime: now.toISOString(),
+      shift,
+      shiftKey: shiftWindow.key,
+      shiftStart: shiftWindow.start.toISOString(),
+      shiftEnd: shiftWindow.end.toISOString(),
+      monthKey,
+      chatId,
+      chatTitle: chatLabel,
+      text,
+      isCountdown,
+      countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
+    });
+
+    if (!mongoResult.accepted) {
+      const existingName = mongoResult.existing?.fullname || mongoResult.existing?.username || "มีคนอื่น";
+      const resetTime = formatResetTime(shiftWindow.end);
+      bot.sendMessage(
+        msg.chat.id,
+        `ปฏิเสธข้อมูลครับ รอบนี้ ${existingName} รีไลน์เป็นคนแรกแล้ว\nรอบถัดไปเริ่ม ${resetTime} น.`
+      );
+      return;
+    }
+
+    // Insert accepted first reline into local SQLite for backward compatibility.
     return new Promise((resolve, reject) => {
       db.run(
         `
@@ -346,20 +418,6 @@ bot.on("message", async (msg) => {
           }
 
           try {
-            await saveRelineToMongo({
-              telegramId,
-              username,
-              fullname,
-              relineTime: now.toISOString(),
-              shift,
-              monthKey,
-              chatId,
-              chatTitle: chatLabel,
-              text,
-              isCountdown,
-              countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
-            });
-
             const rows = await buildMonthlySummary(chatId);
             const me = rows.find((row) => row.telegram_id === telegramId);
             const myTotal = me ? me.total : 1;
