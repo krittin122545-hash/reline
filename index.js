@@ -56,6 +56,8 @@ app.use(express.json());
 app.use(express.static(__dirname));
 
 const firstUserPerUtcShiftEnabled = process.env.FIRST_USER_PER_UTC_SHIFT === "true";
+// Test/prod can choose UTC shift boundaries without depending on server local time.
+const utcShiftStartHours = parseUtcShiftStartHours(process.env.UTC_SHIFT_START_HOURS);
 
 let mongoClient = null;
 let mongoDb = null;
@@ -217,16 +219,38 @@ function getShift(date) {
   return "00-06";
 }
 
+function parseUtcShiftStartHours(value) {
+  const fallback = [0, 6, 12, 18];
+  if (!value) return fallback;
+
+  const hours = value
+    .split(",")
+    .map((part) => Number(part.trim()))
+    .filter((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23);
+  const uniqueHours = [...new Set(hours)].sort((a, b) => a - b);
+
+  return uniqueHours.length ? uniqueHours : fallback;
+}
+
 function getUtcShiftWindow(date) {
   const start = new Date(date);
   const h = start.getUTCHours();
-  const startHour = h >= 18 ? 18 : h >= 12 ? 12 : h >= 6 ? 6 : 0;
+  const startHour = [...utcShiftStartHours].reverse().find((hour) => h >= hour) ?? utcShiftStartHours[utcShiftStartHours.length - 1];
+
+  if (startHour > h) {
+    start.setUTCDate(start.getUTCDate() - 1);
+  }
+
   start.setUTCHours(startHour, 0, 0, 0);
 
+  const nextStartHour = utcShiftStartHours.find((hour) => hour > startHour) ?? utcShiftStartHours[0];
   const end = new Date(start);
-  end.setUTCHours(start.getUTCHours() + 6);
+  if (nextStartHour <= startHour) {
+    end.setUTCDate(end.getUTCDate() + 1);
+  }
+  end.setUTCHours(nextStartHour, 0, 0, 0);
 
-  const label = `${String(startHour).padStart(2, "0")}-${String((startHour + 6) % 24).padStart(2, "0")}`;
+  const label = `${String(startHour).padStart(2, "0")}-${String(nextStartHour).padStart(2, "0")}`;
 
   return {
     start,

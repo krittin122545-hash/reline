@@ -11,7 +11,7 @@ services:
       - mongo-test-data:/data/db
 
   reline-bot-test:
-    image: kikonet0122545/reline:1.0.4
+    image: kikonet0122545/reline:1.0.5
     restart: unless-stopped
     depends_on:
       - mongo-test
@@ -20,6 +20,7 @@ services:
     environment:
       NODE_ENV: production
       FIRST_USER_PER_UTC_SHIFT: "true"
+      UTC_SHIFT_START_HOURS: "17,23,5,11"
       PORT: ${PORT:-10001}
       BOT_TOKEN: ${BOT_TOKEN}
       MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-example}@mongo-test:27017/reline-bot-test?authSource=admin
