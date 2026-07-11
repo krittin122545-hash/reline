@@ -55,6 +55,8 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(__dirname));
 
+const firstUserPerUtcShiftEnabled = process.env.FIRST_USER_PER_UTC_SHIFT === "true";
+
 let mongoClient = null;
 let mongoDb = null;
 
@@ -76,14 +78,9 @@ async function connectMongo() {
 
     await mongoDb.collection("reline_logs").createIndex({ createdAt: -1 });
     await mongoDb.collection("reline_logs").createIndex({ monthKey: 1, chatId: 1 });
-    await mongoDb.collection("reline_logs").createIndex(
+    await mongoDb.collection("reline_shift_locks").createIndex(
       { chatId: 1, shiftKey: 1 },
-      {
-        unique: true,
-        partialFilterExpression: {
-          shiftKey: { $exists: true },
-        },
-      }
+      { unique: true }
     );
     console.log("MongoDB connected:", mongoUri);
     return mongoDb;
@@ -95,25 +92,43 @@ async function connectMongo() {
 
 async function saveRelineToMongo(payload) {
   const db = await connectMongo();
-  const collection = db.collection("reline_logs");
+  await db.collection("reline_logs").insertOne({
+    ...payload,
+    createdAt: new Date(),
+  });
+}
 
-  try {
-    await collection.insertOne({
-      ...payload,
-      createdAt: new Date(),
-    });
-    return { accepted: true };
-  } catch (error) {
-    if (error.code === 11000) {
-      const existing = await collection.findOne({
+async function acquireShiftLock(payload) {
+  if (!firstUserPerUtcShiftEnabled) {
+    return true;
+  }
+
+  const db = await connectMongo();
+
+  // Atomic upsert guarantees only the first message in the UTC shift creates the lock.
+  const result = await db.collection("reline_shift_locks").updateOne(
+    {
+      chatId: payload.chatId,
+      shiftKey: payload.shiftKey,
+    },
+    {
+      $setOnInsert: {
         chatId: payload.chatId,
         shiftKey: payload.shiftKey,
-      });
-      return { accepted: false, existing };
-    }
+        shiftLabel: payload.shift,
+        shiftStart: payload.shiftStart,
+        shiftEnd: payload.shiftEnd,
+        telegramId: payload.telegramId,
+        username: payload.username,
+        fullname: payload.fullname,
+        text: payload.text,
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
 
-    throw error;
-  }
+  return result.upsertedCount === 1;
 }
 
 connectMongo().catch((error) => {
@@ -202,19 +217,22 @@ function getShift(date) {
   return "00-06";
 }
 
-function getShiftWindow(date) {
+function getUtcShiftWindow(date) {
   const start = new Date(date);
-  const h = start.getHours();
+  const h = start.getUTCHours();
   const startHour = h >= 18 ? 18 : h >= 12 ? 12 : h >= 6 ? 6 : 0;
-  start.setHours(startHour, 0, 0, 0);
+  start.setUTCHours(startHour, 0, 0, 0);
 
   const end = new Date(start);
-  end.setHours(start.getHours() + 6);
+  end.setUTCHours(start.getUTCHours() + 6);
+
+  const label = `${String(startHour).padStart(2, "0")}-${String((startHour + 6) % 24).padStart(2, "0")}`;
 
   return {
     start,
     end,
     key: start.toISOString(),
+    label,
   };
 }
 
@@ -351,8 +369,8 @@ bot.on("message", async (msg) => {
     const chatLabel = getChatLabel(msg);
 
     const now = new Date();
-    const shift = getShift(now);
-    const shiftWindow = getShiftWindow(now);
+    const shiftWindow = getUtcShiftWindow(now);
+    const shift = firstUserPerUtcShiftEnabled ? shiftWindow.label : getShift(now);
     const monthKey = getMonthKey(now);
     const username = msg.from.username || "";
     const fullname = `${msg.from.first_name || ""} ${msg.from.last_name || ""}`.trim();
@@ -366,7 +384,7 @@ bot.on("message", async (msg) => {
 
     if (!isReline && !isCountdown) return;
 
-    const mongoResult = await saveRelineToMongo({
+    const payload = {
       telegramId,
       username,
       fullname,
@@ -381,11 +399,14 @@ bot.on("message", async (msg) => {
       text,
       isCountdown,
       countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
-    });
+    };
 
-    if (!mongoResult.accepted) {
+    const hasShiftLock = await acquireShiftLock(payload);
+    if (!hasShiftLock) {
       return;
     }
+
+    await saveRelineToMongo(payload);
 
     // Insert accepted first reline into local SQLite for backward compatibility.
     return new Promise((resolve, reject) => {

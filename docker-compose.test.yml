@@ -1,0 +1,28 @@
+name: reline-bot-test
+
+services:
+  mongo-test:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-example}
+    volumes:
+      - mongo-test-data:/data/db
+
+  reline-bot-test:
+    image: kikonet0122545/reline:1.0.4
+    restart: unless-stopped
+    depends_on:
+      - mongo-test
+    ports:
+      - "${PORT:-10001}:${PORT:-10001}"
+    environment:
+      NODE_ENV: production
+      FIRST_USER_PER_UTC_SHIFT: "true"
+      PORT: ${PORT:-10001}
+      BOT_TOKEN: ${BOT_TOKEN}
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-example}@mongo-test:27017/reline-bot-test?authSource=admin
+
+volumes:
+  mongo-test-data:

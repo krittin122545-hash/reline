@@ -1,4 +1,5 @@
 .env
+.env.test
 .bot.lock
 bot.log
 reline.db
