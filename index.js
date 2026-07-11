@@ -218,14 +218,6 @@ function getShiftWindow(date) {
   };
 }
 
-function formatResetTime(date) {
-  return date.toLocaleTimeString("th-TH", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-}
-
 function getMonthKey(date) {
   return date.toISOString().slice(0, 7);
 }
@@ -392,12 +384,6 @@ bot.on("message", async (msg) => {
     });
 
     if (!mongoResult.accepted) {
-      const existingName = mongoResult.existing?.fullname || mongoResult.existing?.username || "มีคนอื่น";
-      const resetTime = formatResetTime(shiftWindow.end);
-      bot.sendMessage(
-        msg.chat.id,
-        `ปฏิเสธข้อมูลครับ รอบนี้ ${existingName} รีไลน์เป็นคนแรกแล้ว\nรอบถัดไปเริ่ม ${resetTime} น.`
-      );
       return;
     }
 
