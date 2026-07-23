@@ -7,6 +7,7 @@ const sqlite3 = require("sqlite3").verbose();
 const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
+const createRouter = require("./routes");
 
 process.chdir(__dirname);
 
@@ -55,41 +56,58 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(__dirname));
 
-const firstUserPerUtcShiftEnabled = process.env.FIRST_USER_PER_UTC_SHIFT === "true";
+const firstUserPerUtcShiftEnabled = process.env.FIRST_USER_PER_UTC_SHIFT !== "false";
 // Test/prod can choose UTC shift boundaries without depending on server local time.
 const utcShiftStartHours = parseUtcShiftStartHours(process.env.UTC_SHIFT_START_HOURS);
 
 let mongoClient = null;
 let mongoDb = null;
+let mongoConnectPromise = null;
 
-async function connectMongo() {
-  if (mongoClient) return mongoDb;
+function connectMongo() {
+  if (mongoDb) return Promise.resolve(mongoDb);
+  if (mongoConnectPromise) return mongoConnectPromise;
 
   const mongoUri = process.env.MONGODB_URI || "mongodb://root:example@127.0.0.1:27017/reline-bot?authSource=admin";
 
-  try {
-    mongoClient = new MongoClient(mongoUri, {
+  mongoConnectPromise = (async () => {
+    const client = new MongoClient(mongoUri, {
       serverSelectionTimeoutMS: 5000,
     });
 
-    await mongoClient.connect();
+    try {
+      await client.connect();
 
-    const parsedUri = new URL(mongoUri);
-    const dbName = parsedUri.pathname.replace(/^\/+/, "") || "reline-bot";
-    mongoDb = mongoClient.db(dbName);
+      const parsedUri = new URL(mongoUri);
+      const dbName = parsedUri.pathname.replace(/^\/+/, "") || "reline-bot";
+      const db = client.db(dbName);
 
-    await mongoDb.collection("reline_logs").createIndex({ createdAt: -1 });
-    await mongoDb.collection("reline_logs").createIndex({ monthKey: 1, chatId: 1 });
-    await mongoDb.collection("reline_shift_locks").createIndex(
-      { chatId: 1, shiftKey: 1 },
-      { unique: true }
-    );
-    console.log("MongoDB connected:", mongoUri);
-    return mongoDb;
-  } catch (error) {
-    console.error("MongoDB connection failed:", error.message);
-    throw error;
-  }
+      await db.collection("reline_logs").createIndex({ createdAt: -1 });
+      await db.collection("reline_logs").createIndex({ monthKey: 1, chatId: 1 });
+      await db.collection("reline_shift_locks").createIndex(
+        { lockScope: 1, shiftKey: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            lockScope: { $exists: true },
+            shiftKey: { $exists: true },
+          },
+        }
+      );
+
+      mongoClient = client;
+      mongoDb = db;
+      console.log("MongoDB connected");
+      return mongoDb;
+    } catch (error) {
+      await client.close().catch(() => {});
+      mongoConnectPromise = null;
+      console.error("MongoDB connection failed:", error.message);
+      throw error;
+    }
+  })();
+
+  return mongoConnectPromise;
 }
 
 async function saveRelineToMongo(payload) {
@@ -107,30 +125,45 @@ async function acquireShiftLock(payload) {
 
   const db = await connectMongo();
 
-  // Atomic upsert guarantees only the first message in the UTC shift creates the lock.
-  const result = await db.collection("reline_shift_locks").updateOne(
-    {
-      chatId: payload.chatId,
-      shiftKey: payload.shiftKey,
-    },
-    {
-      $setOnInsert: {
-        chatId: payload.chatId,
+  try {
+    // Atomic upsert guarantees only one message can create the global UTC shift lock.
+    const result = await db.collection("reline_shift_locks").findOneAndUpdate(
+      {
+        lockScope: "global",
         shiftKey: payload.shiftKey,
-        shiftLabel: payload.shift,
-        shiftStart: payload.shiftStart,
-        shiftEnd: payload.shiftEnd,
-        telegramId: payload.telegramId,
-        username: payload.username,
-        fullname: payload.fullname,
-        text: payload.text,
-        createdAt: new Date(),
       },
-    },
-    { upsert: true }
-  );
+      {
+        $setOnInsert: {
+          lockScope: "global",
+          shiftKey: payload.shiftKey,
+          shiftLabel: payload.shift,
+          shiftStart: payload.shiftStart,
+          shiftEnd: payload.shiftEnd,
+          telegramId: payload.telegramId,
+          username: payload.username,
+          fullname: payload.fullname,
+          chatId: payload.chatId,
+          chatTitle: payload.chatTitle,
+          text: payload.text,
+          messageId: payload.messageId,
+          createdAt: new Date(),
+        },
+      },
+      {
+        upsert: true,
+        returnDocument: "after",
+        includeResultMetadata: true,
+      }
+    );
 
-  return result.upsertedCount === 1;
+    return Boolean(result.lastErrorObject && result.lastErrorObject.upserted);
+  } catch (error) {
+    if (error && error.code === 11000) {
+      return false;
+    }
+
+    throw error;
+  }
 }
 
 connectMongo().catch((error) => {
@@ -210,17 +243,8 @@ function initDb() {
 
 initDb();
 
-function getShift(date) {
-  const h = date.getHours();
-
-  if (h >= 6 && h < 12) return "06-12";
-  if (h >= 12 && h < 18) return "12-18";
-  if (h >= 18 && h < 24) return "18-24";
-  return "00-06";
-}
-
 function parseUtcShiftStartHours(value) {
-  const fallback = [0, 6, 12, 18];
+  const fallback = [5, 11, 17, 23];
   if (!value) return fallback;
 
   const hours = value
@@ -366,26 +390,13 @@ function formatMonthlySummary(rows, chatLabel) {
   return `สรุป ${chatLabel} ${monthLabel}:\n${lines.join("\n")}`;
 }
 
-bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, "สวัสดีครับ! พิมพ์ว่า รีไลน์ เพื่อบันทึกและดูสรุปเดือนนี้\nใช้ /summary เพื่อดูสรุปเดือนนี้\nพิมพ์ตัวเลขเพื่อนับย้อนหลัง เช่น 10 = นับจาก 10 ลงมา 1");
-});
-
-bot.onText(/\/summary|\/stats/i, async (msg) => {
-  try {
-    const chatId = String(msg.chat.id);
-    const chatLabel = getChatLabel(msg);
-    const rows = await buildMonthlySummary(chatId);
-    bot.sendMessage(msg.chat.id, formatMonthlySummary(rows, chatLabel));
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(msg.chat.id, "ไม่สามารถสรุปข้อมูลได้ในขณะนี้");
-  }
-});
-
-// Handle both "รีไลน์" and numbered countdown commands
+// Every Telegram message must pass the UTC shift lock before any command processing.
 bot.on("message", async (msg) => {
   try {
+    if (!msg.from || !msg.chat) {
+      return;
+    }
+
     const text = msg.text || "";
     const chatId = String(msg.chat.id);
     const telegramId = String(msg.from.id);
@@ -394,41 +405,62 @@ bot.on("message", async (msg) => {
 
     const now = new Date();
     const shiftWindow = getUtcShiftWindow(now);
-    const shift = firstUserPerUtcShiftEnabled ? shiftWindow.label : getShift(now);
+    const shift = shiftWindow.label;
     const monthKey = getMonthKey(now);
     const username = msg.from.username || "";
     const fullname = `${msg.from.first_name || ""} ${msg.from.last_name || ""}`.trim();
-
-    // Check for "รีไลน์" keyword (supports variations)
-    const isReline = /รีไลน์|reline/i.test(text);
-    
-    // Check for countdown numbers (1-99)
-    const countdownMatch = text.match(/^\s*(\d+)\s*$/);
-    const isCountdown = countdownMatch && parseInt(countdownMatch[1]) >= 1 && parseInt(countdownMatch[1]) <= 99;
-
-    if (!isReline && !isCountdown) return;
-
-    const payload = {
+    const lockPayload = {
       telegramId,
       username,
       fullname,
-      relineTime: now.toISOString(),
       shift,
       shiftKey: shiftWindow.key,
       shiftStart: shiftWindow.start.toISOString(),
       shiftEnd: shiftWindow.end.toISOString(),
-      monthKey,
       chatId,
       chatTitle: chatLabel,
       text,
-      isCountdown,
-      countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
+      messageId: msg.message_id,
     };
 
-    const hasShiftLock = await acquireShiftLock(payload);
+    let hasShiftLock = false;
+    try {
+      hasShiftLock = await acquireShiftLock(lockPayload);
+    } catch (error) {
+      console.error("Shift lock error:", error);
+      return;
+    }
+
     if (!hasShiftLock) {
       return;
     }
+
+    if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
+      await bot.sendMessage(chatId, "สวัสดีครับ! พิมพ์ว่า รีไลน์ เพื่อบันทึกและดูสรุปเดือนนี้\nใช้ /summary เพื่อดูสรุปเดือนนี้\nพิมพ์ตัวเลขเพื่อนับย้อนหลัง เช่น 10 = นับจาก 10 ลงมา 1");
+      return;
+    }
+
+    if (/^\/(?:summary|stats)(?:@\w+)?(?:\s|$)/i.test(text)) {
+      const rows = await buildMonthlySummary(chatId);
+      await bot.sendMessage(msg.chat.id, formatMonthlySummary(rows, chatLabel));
+      return;
+    }
+
+    const isReline = /รีไลน์|reline/i.test(text);
+    const countdownMatch = text.match(/^\s*(\d+)\s*$/);
+    const isCountdown = countdownMatch && parseInt(countdownMatch[1]) >= 1 && parseInt(countdownMatch[1]) <= 99;
+
+    if (!isReline && !isCountdown) {
+      return;
+    }
+
+    const payload = {
+      ...lockPayload,
+      relineTime: now.toISOString(),
+      monthKey,
+      isCountdown,
+      countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
+    };
 
     await saveRelineToMongo(payload);
 
@@ -485,28 +517,11 @@ bot.on("message", async (msg) => {
   }
 });
 
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "dashboard.html"));
-});
-
-app.get("/logs", async (req, res) => {
-  try {
-    const rows = await getRelineLogsFromMongo();
-    res.json(rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get("/summary", async (req, res) => {
-  try {
-    const chatId = req.query.chat_id ? String(req.query.chat_id) : null;
-    const rows = await buildMonthlySummary(chatId);
-    res.json(rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+app.use("/", createRouter({
+  dashboardPath: path.join(__dirname, "dashboard.html"),
+  getRelineLogsFromMongo,
+  buildMonthlySummary,
+}));
 
 const port = process.env.PORT || 3000;
 

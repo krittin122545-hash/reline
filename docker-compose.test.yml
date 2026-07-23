@@ -11,7 +11,7 @@ services:
       - mongo-test-data:/data/db
 
   reline-bot-test:
-    image: kikonet0122545/reline:1.0.5
+    image: kikonet0122545/reline:1.0.7
     restart: unless-stopped
     depends_on:
       - mongo-test
