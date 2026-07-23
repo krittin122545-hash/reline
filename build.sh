@@ -2,7 +2,7 @@
 set -eu
 
 IMAGE_NAME="kikonet0122545/reline"
-VERSION="1.0.7"
+VERSION="1.0.8"
 
 docker login
 docker build -t "${IMAGE_NAME}:${VERSION}" .

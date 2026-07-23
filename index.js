@@ -8,6 +8,7 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
 const createRouter = require("./routes");
+const parseRelineCommand = require("./lib/parse-reline-command");
 
 process.chdir(__dirname);
 
@@ -390,7 +391,7 @@ function formatMonthlySummary(rows, chatLabel) {
   return `สรุป ${chatLabel} ${monthLabel}:\n${lines.join("\n")}`;
 }
 
-// Every Telegram message must pass the UTC shift lock before any command processing.
+// Commands and ordinary chat never consume a UTC shift lock.
 bot.on("message", async (msg) => {
   try {
     if (!msg.from || !msg.chat) {
@@ -409,6 +410,23 @@ bot.on("message", async (msg) => {
     const monthKey = getMonthKey(now);
     const username = msg.from.username || "";
     const fullname = `${msg.from.first_name || ""} ${msg.from.last_name || ""}`.trim();
+
+    if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
+      await bot.sendMessage(chatId, "สวัสดีครับ! พิมพ์ว่า รีไลน์ เพื่อบันทึกและดูสรุปเดือนนี้\nใช้ /summary เพื่อดูสรุปเดือนนี้\nหากต้องการนับย้อนหลังให้พิมพ์ เช่น รีไลน์ 10");
+      return;
+    }
+
+    if (/^\/(?:summary|stats)(?:@\w+)?(?:\s|$)/i.test(text)) {
+      const rows = await buildMonthlySummary(chatId);
+      await bot.sendMessage(msg.chat.id, formatMonthlySummary(rows, chatLabel));
+      return;
+    }
+
+    const relineCommand = parseRelineCommand(text);
+    if (!relineCommand.isReline) {
+      return;
+    }
+
     const lockPayload = {
       telegramId,
       username,
@@ -435,31 +453,12 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
-      await bot.sendMessage(chatId, "สวัสดีครับ! พิมพ์ว่า รีไลน์ เพื่อบันทึกและดูสรุปเดือนนี้\nใช้ /summary เพื่อดูสรุปเดือนนี้\nพิมพ์ตัวเลขเพื่อนับย้อนหลัง เช่น 10 = นับจาก 10 ลงมา 1");
-      return;
-    }
-
-    if (/^\/(?:summary|stats)(?:@\w+)?(?:\s|$)/i.test(text)) {
-      const rows = await buildMonthlySummary(chatId);
-      await bot.sendMessage(msg.chat.id, formatMonthlySummary(rows, chatLabel));
-      return;
-    }
-
-    const isReline = /รีไลน์|reline/i.test(text);
-    const countdownMatch = text.match(/^\s*(\d+)\s*$/);
-    const isCountdown = countdownMatch && parseInt(countdownMatch[1]) >= 1 && parseInt(countdownMatch[1]) <= 99;
-
-    if (!isReline && !isCountdown) {
-      return;
-    }
-
     const payload = {
       ...lockPayload,
       relineTime: now.toISOString(),
       monthKey,
-      isCountdown,
-      countdownTarget: isCountdown ? parseInt(countdownMatch[1]) : null,
+      isCountdown: relineCommand.countdownTarget !== null,
+      countdownTarget: relineCommand.countdownTarget,
     };
 
     await saveRelineToMongo(payload);
@@ -487,9 +486,8 @@ bot.on("message", async (msg) => {
 
             let responseText = `✅ บันทึกรีไลน์แล้ว: ${displayName}\n📊 เดือนนี้คุณมี ${myTotal} ครั้ง\n`;
 
-            // Add countdown if user sent a number
-            if (isCountdown) {
-              const target = parseInt(countdownMatch[1]);
+            if (relineCommand.countdownTarget !== null) {
+              const target = relineCommand.countdownTarget;
               const remaining = target - myTotal;
               if (remaining > 0) {
                 responseText += `⏱️ นับย้อนหลังจาก ${target}: เหลือ ${remaining} ครั้ง\n`;
